@@ -1,0 +1,10 @@
+; Пример BIND .zone для sync master = "file:///etc/certbot-dns/example.com.zone"
+; Формат как экспорт FastDNS (.zone, до 2 MB, до 1000 записей).
+
+$TTL 3600
+$ORIGIN example.com.
+
+www	3600	IN	A	203.0.113.10
+@	3600	IN	A	203.0.113.10
+@	3600	IN	MX	10 mail.example.com.
+_acme-challenge	3600	IN	TXT	"not-copied-when-excluded-from-sync"

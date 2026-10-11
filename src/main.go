@@ -13,7 +13,6 @@ import (
 	"time"
 
 	"github.com/go-acme/lego/v4/challenge/dns01"
-	fastdns "github.com/nf404/libdns-fastdns"
 )
 
 var version = "dev"
@@ -33,15 +32,21 @@ func main() {
 		os.Exit(2)
 	}
 
-	expanded, err := expandAllCerts(cfg.Certificates)
+	registry, err := cfg.buildProviderRegistry()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "провайдеры DNS: %v\n", err)
+		os.Exit(2)
+	}
+
+	expanded, err := expandAllCerts(cfg.Certificates, registry)
 	if err != nil {
 		slog.Error("разбор domains", "err", err)
 		os.Exit(2)
 	}
-	slog.Info("конфиг применён", "config_path", *configPath, "version", version, "expanded_certs", len(expanded), "raw_certificates_blocks", len(cfg.Certificates))
+	slog.Info("конфиг применён", "config_path", *configPath, "version", version, "dns_providers", len(registry), "expanded_certs", len(expanded), "raw_certificates_blocks", len(cfg.Certificates))
 	for i := range expanded {
 		e := &expanded[i]
-		slog.Debug("выпуск из конфига", "index", i, "label", e.Label, "zone", e.Zone, "san", e.Domains, "output_dir", e.OutputDir, "renew_before_days", e.RenewBeforeDays, "key_type", e.KeyType)
+		slog.Debug("выпуск из конфига", "index", i, "label", e.Label, "providers", e.Providers, "zone", e.Zone, "san", e.Domains, "output_dir", e.OutputDir, "renew_before_days", e.RenewBeforeDays, "key_type", e.KeyType)
 	}
 
 	propTimeout, propInterval, err := cfg.propagationDurations()
@@ -59,36 +64,52 @@ func main() {
 	slog.Debug("рекурсивные резолверы для проверки DNS (TXT propagation)", "resolvers", effectivePropagationResolvers(cfg))
 
 	ctx := context.Background()
-	fd := &fastdns.Provider{
-		APIToken: cfg.FastDNS.APIToken,
-		APIUrl:   cfg.FastDNS.APIURL,
+	type zoneKey struct {
+		provider string
+		zone     string
 	}
-	zoneLabels := map[string][]string{}
+	zoneLabels := map[zoneKey][]string{}
 	for i := range expanded {
 		z := strings.TrimSuffix(strings.TrimSpace(expanded[i].Zone), ".")
-		zoneLabels[z] = append(zoneLabels[z], expanded[i].Label)
+		for _, pname := range expanded[i].Providers {
+			k := zoneKey{provider: pname, zone: z}
+			zoneLabels[k] = append(zoneLabels[k], expanded[i].Label)
+		}
 	}
-	zones := make([]string, 0, len(zoneLabels))
-	for z := range zoneLabels {
-		zones = append(zones, z)
+	keys := make([]zoneKey, 0, len(zoneLabels))
+	for k := range zoneLabels {
+		keys = append(keys, k)
 	}
-	sort.Strings(zones)
-	for _, z := range zones {
-		labels := zoneLabels[z]
-		slog.Debug("проверка зоны FastDNS", "zone", z, "cert_labels", labels, "fastdns_api_url", nonEmptyOrDefault(cfg.FastDNS.APIURL, "(default)"))
-		if err := verifyFastDNSZone(ctx, fd, z); err != nil {
-			slog.Error("зона недоступна", "zone", z, "cert_labels", labels, "err", err)
+	sort.Slice(keys, func(i, j int) bool {
+		if keys[i].provider != keys[j].provider {
+			return keys[i].provider < keys[j].provider
+		}
+		return keys[i].zone < keys[j].zone
+	})
+	for _, k := range keys {
+		labels := zoneLabels[k]
+		pr := registry[k.provider]
+		slog.Debug("проверка зоны DNS", "provider", k.provider, "zone", k.zone, "cert_labels", labels)
+		if err := verifyDNSZone(ctx, pr, k.zone); err != nil {
+			slog.Error("зона недоступна", "provider", k.provider, "zone", k.zone, "cert_labels", labels, "err", err)
 			os.Exit(1)
 		}
-		slog.Info("зона FastDNS доступна", "zone", z, "cert_labels", labels)
+		slog.Info("зона DNS доступна", "provider", k.provider, "zone", k.zone, "cert_labels", labels)
 	}
 
 	for cycle := 0; ; cycle++ {
 		now := time.Now()
 		slog.Debug("цикл проверки/выпуска", "cycle", cycle, "time_utc", now.UTC().Format(time.RFC3339Nano))
-		if err := runRenewals(cfg, expanded, now, propTimeout, propInterval, dnsOpts); err != nil {
+		if err := runRenewals(cfg, registry, expanded, now, propTimeout, propInterval, dnsOpts); err != nil {
 			slog.Error("ошибка цикла", "err", err)
 			os.Exit(1)
+		}
+
+		if cfg.syncRunsEveryCycle(cycle) {
+			if err := runDNSSync(ctx, cfg, registry); err != nil {
+				slog.Error("sync DNS", "err", err)
+				os.Exit(1)
+			}
 		}
 
 		if cfg.runtimeMode() == "once" {
@@ -100,6 +121,9 @@ func main() {
 		if err != nil {
 			slog.Error("расчёт паузы", "err", err)
 			os.Exit(1)
+		}
+		if cap, ok := cfg.syncSleepCap(); ok && (d <= 0 || cap < d) {
+			d = cap
 		}
 		if d <= 0 {
 			d = time.Minute
@@ -118,6 +142,7 @@ func nonEmptyOrDefault(s, def string) string {
 
 func runRenewals(
 	cfg *Config,
+	registry map[string]*providerRuntime,
 	expanded []ExpandedCert,
 	now time.Time,
 	propTimeout, propInterval time.Duration,
@@ -144,8 +169,8 @@ func runRenewals(
 			continue
 		}
 
-		slog.Info("запуск ACME Obtain", "label", e.Label, "san", e.Domains, "dns_zone", e.Zone, "key_type", e.KeyType, "out_dir", e.OutputDir)
-		if err := obtainCertificate(cfg, propTimeout, propInterval, dnsOpts, *e); err != nil {
+		slog.Info("запуск ACME Obtain", "label", e.Label, "providers", e.Providers, "san", e.Domains, "dns_zone", e.Zone, "key_type", e.KeyType, "out_dir", e.OutputDir)
+		if err := obtainCertificate(cfg, registry, propTimeout, propInterval, dnsOpts, *e); err != nil {
 			slog.Error("Obtain не удался", "label", e.Label, "err", err)
 			return fmt.Errorf("%s: %w", e.Label, err)
 		}

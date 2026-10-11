@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"crypto"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -11,27 +10,21 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
-	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/go-acme/lego/v4/acme"
 	"github.com/go-acme/lego/v4/acme/api"
 	"github.com/go-acme/lego/v4/certcrypto"
 	"github.com/go-acme/lego/v4/certificate"
-	"github.com/go-acme/lego/v4/challenge"
 	"github.com/go-acme/lego/v4/challenge/dns01"
 	"github.com/go-acme/lego/v4/challenge/resolver"
 	"github.com/go-acme/lego/v4/lego"
 	"github.com/go-acme/lego/v4/registration"
-	"github.com/libdns/libdns"
-	fastdns "github.com/nf404/libdns-fastdns"
 )
 
 // certLiveSymlinkName — имя symlink в output_dir на актуальный каталог выпуска (YYYY-MM-DD).
@@ -55,35 +48,6 @@ func (u *acmeUser) GetPrivateKey() crypto.PrivateKey {
 	return u.key
 }
 
-type fastDNSsolver struct {
-	zone   string
-	client *fastdns.Provider
-
-	propagationTimeout  time.Duration
-	propagationInterval time.Duration
-
-	// afterTXTCreate вызывается после успешного AppendRecords (для чекпоинта возобновления выпуска).
-	afterTXTCreate func(challengeKey, recordID string)
-
-	mu  sync.Mutex
-	ids map[string]string
-}
-
-func (s *fastDNSsolver) Timeout() (timeout, interval time.Duration) {
-	return s.propagationTimeout, s.propagationInterval
-}
-
-// Sequential — lego вызывает последовательный DNS-01 (challenge/resolver.sequentialSolve):
-// один challenge за раз: PreSolve → Solve → CleanUp → пауза → следующий.
-// У FastDNS два параллельных AppendRecords на одно имя (_acme-challenge для *.zone + zone)
-// часто дают ошибку без текста; последовательный режим оставляет в зоне одну TXT за раз.
-func (s *fastDNSsolver) Sequential() time.Duration {
-	if s.propagationInterval > 0 {
-		return s.propagationInterval
-	}
-	return 5 * time.Second
-}
-
 func normalizeFQDN(fqdn string) string {
 	return strings.TrimSuffix(strings.TrimSpace(fqdn), ".")
 }
@@ -99,240 +63,6 @@ func recordNameForZone(effectiveFQDN, zone string) string {
 		return strings.TrimSuffix(effectiveFQDN, suf)
 	}
 	return effectiveFQDN
-}
-
-func (s *fastDNSsolver) challengeKey(domain, keyAuth string) string {
-	return normalizeFQDN(dns01.GetChallengeInfo(domain, keyAuth).EffectiveFQDN)
-}
-
-// restoreTXTRecordIDs подставляет ID записей из чекпоинта, чтобы Present не дублировал TXT при возобновлении.
-func (s *fastDNSsolver) restoreTXTRecordIDs(from map[string]string) {
-	if len(from) == 0 {
-		return
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.ids == nil {
-		s.ids = make(map[string]string)
-	}
-	for k, id := range from {
-		if k != "" && id != "" {
-			s.ids[k] = id
-		}
-	}
-}
-
-func (s *fastDNSsolver) normalizeTXTRecordName(recName string) string {
-	n := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(recName)), ".")
-	z := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(s.zone), "."))
-	if z != "" && strings.HasSuffix(n, "."+z) {
-		n = strings.TrimSuffix(n, "."+z)
-	}
-	return n
-}
-
-func fastDNSHTTPRetriable(err error) bool {
-	if err == nil {
-		return false
-	}
-	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-		return true
-	}
-	var ne net.Error
-	if errors.As(err, &ne) && ne.Timeout() {
-		return true
-	}
-	s := strings.ToLower(err.Error())
-	return strings.Contains(s, "eof") ||
-		strings.Contains(s, "connection reset") ||
-		strings.Contains(s, "broken pipe") ||
-		strings.Contains(s, "timeout") ||
-		strings.Contains(s, "tls: bad record mac") ||
-		strings.Contains(s, "502 bad gateway") ||
-		strings.Contains(s, "503 service") ||
-		strings.Contains(s, "504 gateway") ||
-		strings.Contains(s, "429 too many")
-}
-
-// fastDNSRetryWithValue повторяет вызов API FastDNS при обрывах соединения (EOF, таймауты).
-func fastDNSRetryWithValue[T any](op string, fn func() (T, error)) (T, error) {
-	var zero T
-	delays := []time.Duration{0, 400 * time.Millisecond, 1 * time.Second, 2 * time.Second, 4 * time.Second}
-	var lastErr error
-	for attempt := range delays {
-		if delays[attempt] > 0 {
-			time.Sleep(delays[attempt])
-		}
-		v, err := fn()
-		if err == nil {
-			if attempt > 0 {
-				slog.Info("FastDNS: успех после повтора", "op", op, "attempt", attempt+1)
-			}
-			return v, nil
-		}
-		lastErr = err
-		if !fastDNSHTTPRetriable(err) || attempt == len(delays)-1 {
-			return zero, err
-		}
-		slog.Warn("FastDNS: временная ошибка, повтор", "op", op, "attempt", attempt+1, "err", err)
-	}
-	return zero, lastErr
-}
-
-// purgeConflictingTXT удаляет в зоне все TXT с тем же относительным именем, что и для DNS-01.
-// В панели часто остаются старые _acme-challenge от сорванных выпусков — FastDNS тогда отвечает
-// на AppendRecords пустым message (лимит «одна запись на имя» или отказ дубля).
-func (s *fastDNSsolver) purgeConflictingTXT(ctx context.Context, relName string) (removed int, err error) {
-	recs, err := fastDNSRetryWithValue("GetRecords(purge)", func() ([]libdns.Record, error) {
-		return s.client.GetRecords(ctx, s.zone)
-	})
-	if err != nil {
-		return 0, err
-	}
-	target := s.normalizeTXTRecordName(relName)
-	var deletedIDs []string
-	for _, r := range recs {
-		if !strings.EqualFold(strings.TrimSpace(r.Type), "TXT") {
-			continue
-		}
-		if strings.TrimSpace(r.ID) == "" {
-			continue
-		}
-		if s.normalizeTXTRecordName(r.Name) != target {
-			continue
-		}
-		_, delErr := fastDNSRetryWithValue(fmt.Sprintf("DeleteRecords(purge) id=%s", r.ID), func() (struct{}, error) {
-			_, e := s.client.DeleteRecords(ctx, s.zone, []libdns.Record{{ID: r.ID}})
-			return struct{}{}, e
-		})
-		if delErr != nil {
-			return removed, fmt.Errorf("DeleteRecords TXT id=%s name=%q: %w", r.ID, r.Name, delErr)
-		}
-		deletedIDs = append(deletedIDs, r.ID)
-		removed++
-		slog.Debug("purge: удалена TXT перед ACME Present", "zone", s.zone, "record_id", r.ID, "name", r.Name)
-	}
-	if len(deletedIDs) == 0 {
-		return 0, nil
-	}
-	s.mu.Lock()
-	for chKey, id := range s.ids {
-		for _, did := range deletedIDs {
-			if id == did {
-				delete(s.ids, chKey)
-				break
-			}
-		}
-	}
-	s.mu.Unlock()
-	slog.Info("очищены старые TXT для DNS-01", "zone", s.zone, "relative_name", relName, "removed", removed)
-	return removed, nil
-}
-
-func (s *fastDNSsolver) Present(domain, token, keyAuth string) error {
-	info := dns01.GetChallengeInfo(domain, keyAuth)
-	name := recordNameForZone(info.EffectiveFQDN, s.zone)
-	ctx := context.Background()
-
-	if _, err := s.purgeConflictingTXT(ctx, name); err != nil {
-		return fmt.Errorf("очистка TXT перед Present: %w", err)
-	}
-
-	k := s.challengeKey(domain, keyAuth)
-	s.mu.Lock()
-	already := s.ids[k] != ""
-	s.mu.Unlock()
-	if already {
-		slog.Debug("DNS-01 Present: пропуск (запись уже в памяти/чекпоинте)", "challenge_key", k, "acme_identifier", domain)
-		return nil
-	}
-
-	slog.Debug("DNS-01 Present",
-		"acme_identifier", domain,
-		"txt_fqdn", info.EffectiveFQDN,
-		"txt_name_in_zone", name,
-		"fastdns_zone", s.zone,
-		"ttl_sec", dns01.DefaultTTL,
-	)
-
-	rec := libdns.Record{
-		Type:  "TXT",
-		Name:  name,
-		Value: info.Value,
-		TTL:   time.Duration(dns01.DefaultTTL) * time.Second,
-	}
-
-	added, err := fastDNSRetryWithValue("AppendRecords", func() ([]libdns.Record, error) {
-		return s.client.AppendRecords(ctx, s.zone, []libdns.Record{rec})
-	})
-	if err != nil {
-		if strings.TrimSpace(err.Error()) == "" {
-			slog.Warn("FastDNS AppendRecords: пустое message в ошибке API (лимиты зоны, дубликат имени или квота)",
-				"txt_name_in_zone", name, "fastdns_zone", s.zone)
-			return fmt.Errorf("fastdns AppendRecords (name=%q zone=%q): пустой ответ API", name, s.zone)
-		}
-		return fmt.Errorf("fastdns AppendRecords (name=%q zone=%q): %w", name, s.zone, err)
-	}
-	if len(added) == 0 || added[0].ID == "" {
-		return errors.New("fastdns: пустой ответ AppendRecords (нет ID записи)")
-	}
-
-	recID := added[0].ID
-	s.mu.Lock()
-	if s.ids == nil {
-		s.ids = make(map[string]string)
-	}
-	s.ids[k] = recID
-	cb := s.afterTXTCreate
-	s.mu.Unlock()
-
-	if cb != nil {
-		cb(k, recID)
-	}
-
-	slog.Info("DNS TXT создан в FastDNS", "zone", s.zone, "record_id", recID, "name", name, "acme_identifier", domain)
-
-	return nil
-}
-
-func (s *fastDNSsolver) CleanUp(domain, token, keyAuth string) error {
-	k := s.challengeKey(domain, keyAuth)
-	s.mu.Lock()
-	id := s.ids[k]
-	delete(s.ids, k)
-	s.mu.Unlock()
-	if id == "" {
-		slog.Debug("DNS-01 CleanUp: запись уже удалена или не отслеживалась", "acme_identifier", domain)
-		return nil
-	}
-
-	ctx := context.Background()
-	slog.Debug("DNS-01 CleanUp", "zone", s.zone, "record_id", id, "acme_identifier", domain)
-	_, err := fastDNSRetryWithValue("DeleteRecords(cleanup)", func() (struct{}, error) {
-		_, e := s.client.DeleteRecords(ctx, s.zone, []libdns.Record{{ID: id}})
-		return struct{}{}, e
-	})
-	if err != nil {
-		return fmt.Errorf("fastdns DeleteRecords: %w", err)
-	}
-	slog.Info("DNS TXT удалён из FastDNS", "zone", s.zone, "record_id", id)
-	return nil
-}
-
-var _ challenge.Provider = (*fastDNSsolver)(nil)
-var _ challenge.ProviderTimeout = (*fastDNSsolver)(nil)
-// dns01.Challenge проверяет провайдер на sequential — см. fastDNSsolver.Sequential.
-
-func verifyFastDNSZone(ctx context.Context, fd *fastdns.Provider, zone string) error {
-	zone = strings.TrimSuffix(strings.TrimSpace(zone), ".")
-	recs, err := fastDNSRetryWithValue("GetRecords(verify zone)", func() ([]libdns.Record, error) {
-		return fd.GetRecords(ctx, zone)
-	})
-	if err != nil {
-		return fmt.Errorf("зона %q недоступна через FastDNS API (проверьте токен и имя зоны): %w", zone, err)
-	}
-	slog.Debug("FastDNS GetRecords успешно", "zone", zone, "records_count", len(recs))
-	return nil
 }
 
 func loadOrCreateAccountKey(dir string) (*ecdsa.PrivateKey, error) {
@@ -555,6 +285,7 @@ func buildDNSOpts(cfg *Config) ([]dns01.ChallengeOption, error) {
 
 func obtainCertificate(
 	cfg *Config,
+	registry map[string]*providerRuntime,
 	propTimeout, propInterval time.Duration,
 	dnsOpts []dns01.ChallengeOption,
 	exp ExpandedCert,
@@ -600,9 +331,9 @@ func obtainCertificate(
 	}
 	slog.Debug("lego.NewClient (до регистрации)", "kid_empty", user.GetRegistration() == nil)
 
-	fd := &fastdns.Provider{
-		APIToken: cfg.FastDNS.APIToken,
-		APIUrl:   cfg.FastDNS.APIURL,
+	solverGroup, err := newDNSSolverGroup(registry, exp.Providers, exp.Zone, propTimeout, propInterval)
+	if err != nil {
+		return err
 	}
 
 	if err := registerOrLoad(client, stateDir, user); err != nil {
@@ -623,18 +354,11 @@ func obtainCertificate(
 		return fmt.Errorf("api.Core: %w", err)
 	}
 
-	solver := &fastDNSsolver{
-		zone:                strings.TrimSuffix(strings.TrimSpace(exp.Zone), "."),
-		client:              fd,
-		propagationTimeout:  propTimeout,
-		propagationInterval: propInterval,
-	}
-
 	sm := resolver.NewSolversManager(core)
-	if err := sm.SetDNS01Provider(solver, dnsOpts...); err != nil {
+	if err := sm.SetDNS01Provider(solverGroup, dnsOpts...); err != nil {
 		return fmt.Errorf("SetDNS01Provider: %w", err)
 	}
-	slog.Debug("DNS01 provider установлен", "solver_zone", solver.zone, "propagation_timeout", propTimeout, "propagation_interval", propInterval)
+	slog.Debug("DNS01 provider установлен", "providers", exp.Providers, "solver_zone", exp.Zone, "propagation_timeout", propTimeout, "propagation_interval", propInterval)
 
 	prober := resolver.NewProber(sm)
 	certOpts := certificate.CertifierOptions{
@@ -645,7 +369,7 @@ func obtainCertificate(
 	}
 
 	slog.Info("выпуск сертификата ACME (чекпоинт .obtain-checkpoint.json)", "domains", exp.Domains, "bundle", true)
-	if err := runObtainWithCheckpoint(core, prober, certOpts, solver, exp); err != nil {
+	if err := runObtainWithCheckpoint(core, prober, certOpts, solverGroup, exp); err != nil {
 		return fmt.Errorf("Obtain: %w", err)
 	}
 	slog.Debug("Obtain успешен", "out_dir", exp.OutputDir)

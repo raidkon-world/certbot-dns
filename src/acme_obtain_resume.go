@@ -109,7 +109,7 @@ func sanitizeObtainDomains(domains []string) ([]string, error) {
 	return out, nil
 }
 
-func attachCheckpointTXTHook(solver *fastDNSsolver, outputDir string) {
+func attachCheckpointTXTHook(solver *dns01Solver, outputDir, providerName string) {
 	var mu sync.Mutex
 	solver.afterTXTCreate = func(challengeKey, recordID string) {
 		mu.Lock()
@@ -119,7 +119,7 @@ func attachCheckpointTXTHook(solver *fastDNSsolver, outputDir string) {
 			slog.Warn("чекпоинт: не удалось прочитать при сохранении TXT", "err", err)
 			return
 		}
-		cp.TXTRecordIDs[challengeKey] = recordID
+		cp.TXTRecordIDs[checkpointKeyForProvider(challengeKey, providerName)] = recordID
 		if err := saveObtainCheckpoint(outputDir, cp); err != nil {
 			slog.Warn("чекпоинт: не удалось записать id TXT", "err", err)
 		}
@@ -273,8 +273,8 @@ func finalizeOrderCSR(
 	}
 
 	certRes := &certificate.Resource{
-		Domain:  domains[0],
-		CertURL: respOrder.Certificate,
+		Domain:     domains[0],
+		CertURL:    respOrder.Certificate,
 		PrivateKey: []byte(cp.PrivateKeyPEM),
 	}
 
@@ -306,7 +306,7 @@ func runObtainWithCheckpoint(
 	core *api.Core,
 	prober *resolver.Prober,
 	certOpts certificate.CertifierOptions,
-	solver *fastDNSsolver,
+	solver *dnsSolverGroup,
 	exp ExpandedCert,
 ) error {
 	outDir := exp.OutputDir
@@ -374,7 +374,7 @@ func runObtainWithCheckpoint(
 	}
 
 	if !authzAllValid(authz) {
-		attachCheckpointTXTHook(solver, outDir)
+		solver.attachCheckpointHooks(outDir)
 		slog.Info("запрос DNS-01 (prober)", "label", exp.Label, "authorizations", len(authz))
 		if err := prober.Solve(authz); err != nil {
 			return fmt.Errorf("Solve DNS-01: %w", err)

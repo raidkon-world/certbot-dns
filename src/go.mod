@@ -4,6 +4,7 @@ go 1.25.0
 
 require (
 	github.com/go-acme/lego/v4 v4.35.2
+	github.com/libdns/alidns v1.0.4
 	github.com/libdns/libdns v0.2.1
 	github.com/nf404/libdns-fastdns v0.1.0
 	github.com/pelletier/go-toml/v2 v2.3.1

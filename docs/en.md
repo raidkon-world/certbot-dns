@@ -1,6 +1,6 @@
 # certbot-dns documentation
 
-The `certbot-dns` utility issues and renews Let's Encrypt TLS certificates using **DNS-01** challenges, managing TXT records via the **FastVPS FastDNS** API.
+The `certbot-dns` utility issues and renews Let's Encrypt TLS certificates using **DNS-01** challenges, managing TXT records through one or more DNS providers (**FastVPS FastDNS**, **Alibaba Cloud DNS**). Optional zone mirroring copies records from a master provider or a BIND `.zone` file to slave providers.
 
 ## Table of contents
 
@@ -8,19 +8,26 @@ The `certbot-dns` utility issues and renews Let's Encrypt TLS certificates using
 2. [Installation](#installation)
 3. [Configuration](#configuration)
 4. [Domain expansion and output layout](#domain-expansion-and-output-layout)
-5. [DNS-01 and FastDNS](#dns-01-and-fastdns)
-6. [Renewal and daemon mode](#renewal-and-daemon-mode)
-7. [Obtain checkpoint](#obtain-checkpoint)
-8. [Docker](#docker)
-9. [Logging](#logging)
-10. [Troubleshooting](#troubleshooting)
+5. [DNS-01 and providers](#dns-01-and-providers)
+6. [Zone sync](#zone-sync)
+7. [Renewal and daemon mode](#renewal-and-daemon-mode)
+8. [Obtain checkpoint](#obtain-checkpoint)
+9. [Docker](#docker)
+10. [Logging](#logging)
+11. [Tests](#tests)
+12. [Troubleshooting](#troubleshooting)
 
 ## Requirements
 
 - Go 1.25+ (or Docker)
-- FastVPS account with FastDNS enabled and an API token
-- Domains delegated to FastDNS (the zone must be reachable via the API)
+- Credentials for at least one supported DNS provider
+- Domains delegated to DNS where TXT records for DNS-01 can be created
 - Contact email for ACME registration
+
+| Provider | Credentials |
+|----------|-------------|
+| `fastdns` | FastVPS FastDNS API token |
+| `alibabacloud` | Alibaba Access Key ID + Secret (AliDNS), optional `region_id` |
 
 ## Installation
 
@@ -32,7 +39,7 @@ sudo sh ./get-certbot-dns.sh --dry-run
 sudo sh ./get-certbot-dns.sh
 ```
 
-The script downloads a release tarball (binary, `certbot-dns.service`, config/env examples), creates the `certbot-dns` user, `/var/lib/certbot-dns`, and enables the **daemon** systemd service.
+The release tarball includes the binary, `certbot-dns.service`, `config.example.toml`, `env.example`, and `example.com.zone`.
 
 ```bash
 sudo nano /etc/certbot-dns/config.toml
@@ -53,234 +60,165 @@ sudo cp config.example.toml /etc/certbot-dns/config.toml
 export FASTDNS_API_TOKEN="your-token"
 
 cd src
+go test ./...
 go build -o certbot-dns .
-./certbot-dns
+./certbot-dns -config /etc/certbot-dns/config.toml
 ```
 
 Default config path: `/etc/certbot-dns/config.toml`.
 
 ## Configuration
 
-See [`config.example.toml`](../config.example.toml) in the repository root for a full annotated example.
+Full example: [`config.example.toml`](../config.example.toml). Systemd packaging: [`packaging/config.example.toml`](../packaging/config.example.toml).
+
+Secrets: `/etc/certbot-dns/env` — see `packaging/env.example` (`FASTDNS_API_TOKEN`, `ALIBABA_ACCESS_KEY_ID`, `ALIBABA_ACCESS_KEY_SECRET`, optional `ALIBABA_REGION_ID`).
 
 ### `[acme]` section
 
 | Parameter | Description |
 |-----------|-------------|
 | `email` | ACME account email (required) |
-| `directory` | `production` — live Let's Encrypt; `staging` — test directory |
-| `state_dir` | Directory for `account.key` and `registration.json` (default `.acme-state`) |
+| `directory` | `production` or `staging` |
+| `state_dir` | `account.key` and `registration.json` (default `.acme-state`) |
 | `user_agent` | Optional; default `certbot-dns/1` |
 
-### `[fastdns]` section
+### `[[providers]]` blocks
 
-| Parameter | Description |
-|-----------|-------------|
-| `api_token` | API token; prefer `${FASTDNS_API_TOKEN}` from the environment |
-| `api_url` | Optional base API URL (client default: fastdns.fv.ee) |
+| `type` | Fields |
+|--------|--------|
+| `fastdns` | `api_token`, optional `api_url` |
+| `alibabacloud` | `access_key_id`, `access_key_secret`, optional `region_id` |
+
+Type aliases: `alidns`, `ali-dns`, `alicloud`.
+
+**Backward compatibility:** `[fastdns]` without `[[providers]]` creates provider `name = "default"`. Omitted `provider` on a certificate block uses `default`.
 
 ### `[dns_challenge]` section
 
 | Parameter | Description |
 |-----------|-------------|
-| `propagation_timeout` | Max wait for TXT to appear in DNS (e.g. `24h`) |
+| `propagation_timeout` | Max wait for TXT (e.g. `24h`) |
 | `propagation_interval` | Delay between checks (e.g. `10m`) |
-| `recursive_resolvers` | List of `host:port` for TXT pre-check; if unset — `8.8.8.8:53` and `1.1.1.1:53` |
-
-Set explicit resolvers on private networks. Do not rely only on `127.0.0.53` (systemd-resolved): its cache often differs from what Let's Encrypt sees.
+| `recursive_resolvers` | `host:port` list for pre-check; default `8.8.8.8:53`, `1.1.1.1:53` |
 
 ### `[[certificates]]` blocks
 
 | Parameter | Description |
 |-----------|-------------|
-| `id` | Optional label for logs |
-| `domains` | Name list; see [domain expansion](#domain-expansion-and-output-layout) |
-| `output_dir` | Base directory for this block's certificates |
-| `key_type` | `ec256`, `ec384`, `rsa2048`, … (default `ec256`) |
-| `renew_before_days` | Renew this many days before `NotAfter` (default `25`) |
+| `id` | Optional log label |
+| `provider` | **String or array** of `[[providers]]` names — DNS-01 TXT is written to **every** listed provider |
+| `domains` | See [domain expansion](#domain-expansion-and-output-layout) |
+| `output_dir` | Base output directory |
+| `key_type` | Default `ec256` |
+| `renew_before_days` | Default `25` |
 
-There is **no** `zone` field in config: the FastDNS zone is derived as the last two labels of the apex domain.
+```toml
+[[certificates]]
+id = "sites"
+provider = ["fv-main"]
+domains = ["*.example.com"]
+output_dir = "/var/lib/certbot-dns/certs/sites"
+```
+
+No `zone` field: apex zone is derived from the last two labels of the FQDN.
+
+### `[sync]` section
+
+| Parameter | Description |
+|-----------|-------------|
+| `enabled` | `true` — mirror master → slaves after ACME in the same cycle |
+| `interval` | **`onstart`** (default) — sync once at startup; or a duration (`5m`) — repeat in daemon and cap sleep |
+| `record_types` | Record types to copy (default: A, AAAA, CNAME, MX, TXT, NS, SRV) |
+| `exclude_names` | Glob exclusions; default skips `_acme-challenge*` on sync |
+
+`[[sync.zones]]`: `zone`, `master` (provider name or `file:///path/to.zone`), `slaves` (provider names). Master file: BIND `.zone` export; `$ORIGIN` must match `zone`. Sample: [`packaging/example.com.zone`](../packaging/example.com.zone).
 
 ### `[runtime]` section
 
 | Parameter | Description |
 |-----------|-------------|
-| `mode` | `once` — single pass then exit; `daemon` — loop forever |
-| `poll_when_ok` | In daemon mode: max sleep when all certs are fresh (e.g. `24h`) |
-| `loglevel` | `debug`, `verbose`, `info`, `warning`, `error`, `fatal` |
+| `mode` | `once` or `daemon` |
+| `poll_when_ok` | Max sleep when all certs are fresh |
+| `loglevel` | `debug` … `fatal` |
 
-Environment variables are expanded in config strings via `${VAR}`.
+Use `${VAR}` for environment expansion in config strings.
 
 ## Domain expansion and output layout
 
-One `[[certificates]]` block with multiple `domains` entries may produce **several** separate certificates.
+- `*.example.com` → SAN includes apex; dir `wc-example-com/`
+- Standalone apex → `apex-*`
+- `www.example.com` with `*.example.com` in the same block → same wildcard cert
 
-### Wildcard
+On disk: `output_dir/.../YYYY-MM-DD/*.pem`, symlink `live/`, optional `.obtain-checkpoint.json`.
 
-- `*.example.com` → SAN: `*.example.com` and `example.com` (apex added automatically)
-- Directory: `{output_dir}/wc-example-com/`
-- FastDNS zone: `example.com`
+## DNS-01 and providers
 
-### Standalone apex
+Startup checks `GetRecords` per (provider, zone).
 
-- `example.com` without a matching wildcard in the same list → separate certificate
-- Directory: `{output_dir}/apex-example-com/`
+- Multiple `provider` entries → TXT on each provider for one ACME order
+- **FastDNS:** purge conflicting TXT; sequential challenges
+- **Alibaba Cloud DNS:** standard libdns client
 
-### One-level subdomain under a wildcard
+Zone name heuristic: last two labels of apex (limitations for some ccTLDs).
 
-- With `*.example.com`, the name `www.example.com` joins the same wildcard group
+## Zone sync
 
-### Multiple wildcards in one block
+When enabled, after ACME each zone block:
+
+1. Read master (API or file)
+2. Filter by types and exclusions
+3. `SetRecords` on each slave to match master, preserving excluded names on the slave
+
+**Warning:** sync rewrites the slave zone (except exclusions). Test carefully.
 
 ```toml
-[[certificates]]
-id = "multi"
-domains = [
-  "*.example.com",
-  "*.demo.example.com",
-  "other.net",
-]
-output_dir = "./out/multi"
+[sync]
+enabled = true
+interval = "onstart"
+
+[[sync.zones]]
+zone = "example.com"
+master = "file:///etc/certbot-dns/example.com.zone"
+slaves = ["ali-dns"]
 ```
-
-Creates `wc-example-com`, `wc-demo-example-com`, and `apex-other-net` directories.
-
-### On-disk layout
-
-```
-output_dir/wc-example-com/
-  live -> 2026-05-22          # symlink to the current release
-  2026-05-22/
-    fullchain.pem
-    privkey.pem
-    issuer.pem                # when available
-  .obtain-checkpoint.json     # only during an incomplete obtain
-```
-
-Existing certificates are read from `live/fullchain.pem` first, then legacy `fullchain.pem` in the output root.
-
-## DNS-01 and FastDNS
-
-Before issuance, the tool calls `GetRecords` once per unique zone to verify the token and access.
-
-During challenge handling:
-
-1. Old TXT records with the same relative name are removed (leftovers from failed runs)
-2. TXT records are published **sequentially** (not in parallel): FastDNS often rejects two concurrent `AppendRecords` calls for the same name
-3. After LE validation, the record is deleted (`CleanUp`)
-
-API zone name: for `host.example.com` and `*.server.example.com` the zone is `example.com` (last two labels). For public suffixes like `co.uk` the heuristic may be wrong — plan accordingly.
 
 ## Renewal and daemon mode
 
-### `once` mode
+**once:** single pass, exit 0 on success.
 
-Single pass over all certificates: check expiry, obtain if needed, exit `0` on success.
-
-Suitable for cron or systemd timers:
-
-```cron
-0 3 * * * /usr/local/bin/certs-acme -config /etc/certbot-dns/config.toml
-```
-
-### `daemon` mode
-
-After each cycle the process sleeps until the nearest renewal time (capped by `poll_when_ok`). If fullchain is missing or corrupt, sleep is about one minute.
-
-Renewal triggers when fullchain is absent **or** current time ≥ `NotAfter - renew_before_days`.
+**daemon:** loop ACME → sync (per `interval`) → sleep until renewal (capped by `poll_when_ok` and sync interval when set).
 
 ## Obtain checkpoint
 
-The file `.obtain-checkpoint.json` in the output directory stores:
-
-- ACME order URI
-- FastDNS TXT record IDs
-- Private key PEM (after CSR key generation)
-
-On the next run, issuance **resumes** the same order without duplicating TXT records. The checkpoint is removed after a successful write.
-
-If `domains` changed, the old checkpoint is discarded and a new order is created.
-
-For a stuck invalid order, delete `.obtain-checkpoint.json` manually and run again.
+`.obtain-checkpoint.json` stores order URI, TXT record IDs (`challenge_key|provider` when multiple providers), and key PEM. Resumes the same order; removed on success.
 
 ## Docker
 
-Build from the repository root:
-
-```bash
-docker build -f docker/Dockerfile -t certbot-dns:latest .
-```
-
-Example `docker-compose.yml`:
-
-```yaml
-services:
-  certbot-dns:
-    build:
-      context: .
-      dockerfile: docker/Dockerfile
-    image: certbot-dns:latest
-    environment:
-      FASTDNS_API_TOKEN: ${FASTDNS_API_TOKEN}
-    volumes:
-      - ./config.toml:/etc/certbot-dns/config.toml:ro
-      - acme-state:/var/certs/.acme-state
-      - certs-out:/var/certs/out
-    restart: unless-stopped
-
-volumes:
-  acme-state:
-  certs-out:
-```
-
-Inside the container, use paths under `/var/certs` in `config.toml`:
-
-```toml
-[acme]
-state_dir = "/var/certs/.acme-state"
-
-[[certificates]]
-output_dir = "/var/certs/out/sites"
-```
+See [README.md](../README.md#docker).
 
 ## Logging
 
-| Level | Purpose |
-|-------|---------|
-| `debug` | Maximum detail + file:line on each line |
-| `verbose` | Same filter as debug, without file:line |
-| `info` | Normal operation (recommended) |
-| `warning` / `error` | Warnings and errors only |
-| `fatal` | Critical messages and immediate exit |
+Levels: `debug`, `verbose`, `info`, `warning`, `error`, `fatal`. lego logs go to slog.
 
-lego library logs are forwarded to the same slog handler.
+## Tests
+
+```bash
+cd src && go test ./...
+cd src && go test ./... -cover
+```
 
 ## Troubleshooting
 
-### Zone unavailable via FastDNS API
+| Issue | Action |
+|-------|--------|
+| Zone API error | Check credentials, delegation, zone name in logs |
+| FastDNS empty AppendRecords error | Stale TXT; check panel |
+| Sync damaged slave zone | Disable sync; restore backup; review master/exclusions |
+| TXT propagation | Increase timeout; set `recursive_resolvers` |
+| First tests | `directory = "staging"` |
 
-Verify the token, that the domain is delegated to FastDNS, and that the zone name matches the last two apex labels (see log line `проверка зоны FastDNS` / zone check).
-
-### AppendRecords with empty error message
-
-Often caused by a one-TXT-per-name limit or stale `_acme-challenge` records. The tool purges conflicting TXT before `Present`; if it persists, inspect the FastDNS panel manually.
-
-### TXT not propagating
-
-Increase `propagation_timeout` or decrease `propagation_interval`. Set `recursive_resolvers` reachable from your network.
-
-### Staging vs production
-
-Use `directory = "staging"` for first tests. Staging certificates are untrusted in browsers but have relaxed rate limits.
-
-### Exit codes
-
-| Code | Meaning |
-|------|---------|
-| `0` | Success (`once` mode) |
-| `1` | Obtain failure, zone error, or daemon cycle error |
-| `2` | Configuration or argument error |
+Exit codes: `0` success, `1` runtime/obtain/sync, `2` config.
 
 ---
 
-Russian documentation: [docs/ru.md](ru.md)
+Russian: [docs/ru.md](ru.md) · all languages: [docs/README.md](README.md)

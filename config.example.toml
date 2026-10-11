@@ -1,11 +1,17 @@
 # =============================================================================
-# Пример TOML-конфигурации ACME + FastVPS FastDNS.
+# Пример TOML-конфигурации certbot-dns: ACME + DNS-провайдеры + sync зон.
 # Скопируйте в /etc/certbot-dns/config.toml или укажите: certbot-dns -config /path/to/config.toml
 # =============================================================================
 #
-# Домены и зона: поле zone в конфиге не используется — зона FastDNS для API выводится как
-# «последние две метки» имени (host.example.com → example.com; *.server.raidkon.com → raidkon.com).
-# Проверка GetRecords выполняется один раз на каждую уникальную такую зону. Подробнее — [[certificates]].domains.
+# Провайдеры задаются именованными блоками [[providers]]. Имя (name) ссылается
+# в [[certificates]].provider и в [sync] (master / slaves).
+#
+# Зона для DNS-01 выводится автоматически: последние две метки apex
+# (host.example.com → example.com).
+#
+# Обратная совместимость: секция [fastdns] без [[providers]] автоматически
+# создаёт провайдер name = "default", type = "fastdns". В [[certificates]]
+# можно не указывать provider — тогда используется "default".
 #
 # =============================================================================
 
@@ -16,131 +22,191 @@
 [acme]
 # Контактный email для регистрации ACME (Let's Encrypt может слать уведомления).
 email = "admin@example.com"
-# Каталог ЦС: "production" — боевой LE (доверенные сертификаты); "staging" — тестовый LE (не доверяют браузеры).
+# Каталог ЦС: "production" — боевой LE; "staging" — тестовый LE (не доверяют браузеры).
 directory = "production"
 # Каталог для account.key (EC P-256 ключ ACME-аккаунта) и registration.json.
 state_dir = ".acme-state"
-# Необязательно. Строка User-Agent в запросах к ACME; если пусто — встроенное значение в бинарнике.
+# Необязательно. Строка User-Agent в запросах к ACME; если пусто — встроенное значение.
 # user_agent = "certbot-dns/1"
 
 # -----------------------------------------------------------------------------
-# [fastdns] — API FastVPS FastDNS (DNS-01)
+# [[providers]] — именованные DNS-провайдеры (один блок = один экземпляр API)
 # -----------------------------------------------------------------------------
 
-[fastdns]
-# Токен авторизации FastDNS. Рекомендуется ${FASTDNS_API_TOKEN} из окружения, не хранить секрет в git.
+# --- FastVPS FastDNS ---
+[[providers]]
+name = "fv-main"
+type = "fastdns"
+# Токен авторизации FastDNS. Рекомендуется ${FASTDNS_API_TOKEN} из окружения.
 api_token = "${FASTDNS_API_TOKEN}"
-# Необязательно. Базовый URL API; если пусто — используется адрес по умолчанию в клиенте (fastdns.fv.ee).
+# Необязательно. Базовый URL API; если пусто — fastdns.fv.ee.
 # api_url = ""
-# DNS-01 для FastDNS выполняется последовательно (одна TXT за раз): у API часто нельзя два
-# параллельных AppendRecords на одно имя (_acme-challenge при сертификате *.domain + domain).
-# Перед каждым Present удаляются старые TXT с тем же именем в зоне (остатки сорванных выпусков).
+# DNS-01 для FastDNS выполняется последовательно (одна TXT за раз): у API часто нельзя
+# два параллельных AppendRecords на одно имя (_acme-challenge при *.domain + domain).
+# Перед каждым Present удаляются старые TXT с тем же именем (остатки сорванных выпусков).
+
+# --- Alibaba Cloud DNS (AliDNS) ---
+# [[providers]]
+# name = "ali-dns"
+# type = "alibabacloud"
+# access_key_id = "${ALIBABA_ACCESS_KEY_ID}"
+# access_key_secret = "${ALIBABA_ACCESS_KEY_SECRET}"
+# region_id = "${ALIBABA_REGION_ID}"
+
+# -----------------------------------------------------------------------------
+# [fastdns] — устаревший формат (обратная совместимость)
+# -----------------------------------------------------------------------------
+# Если задан только [fastdns] без [[providers]], приложение создаёт провайдер
+# name = "default", type = "fastdns" с этими полями. Новые установки используйте [[providers]].
+#
+# [fastdns]
+# api_token = "${FASTDNS_API_TOKEN}"
+# api_url = ""
 
 # -----------------------------------------------------------------------------
 # [dns_challenge] — ожидание распространения TXT перед проверкой у ЦС
 # -----------------------------------------------------------------------------
 
 [dns_challenge]
-# Максимальное суммарное время ожидания появления TXT (синтаксис Go: 24h, 90m, 1h30m).
+# Максимальное суммарное время ожидания появления TXT (синтаксис Go: 24h, 90m).
 propagation_timeout = "24h"
 # Пауза между опросами DNS (и первая пауза перед первой проверкой внутри lego).
 propagation_interval = "10m"
-# Рекурсивные резолверы "host:port" для pre-check: «виден ли TXT в DNS» до запроса к Let's Encrypt.
-# Если не задано, приложение само использует 8.8.8.8 и 1.1.1.1 — так надёжнее, чем только 127.0.0.53
-# из /etc/resolv.conf (systemd-resolved часто кэширует и не совпадает с тем, что видит ЦС).
-# Явно задайте свои резолверы в закрытой сети, например: recursive_resolvers = ["10.0.0.1:53"]
+# Рекурсивные резолверы "host:port" для pre-check TXT до запроса к Let's Encrypt.
+# Если не задано — 8.8.8.8 и 1.1.1.1 (надёжнее, чем только 127.0.0.53 systemd-resolved).
 # recursive_resolvers = ["8.8.8.8:53", "1.1.1.1:53"]
 
 # -----------------------------------------------------------------------------
-# [[certificates]] — один блок: один список domains → несколько выпусков и подпапок
+# [[certificates]] — один блок: список domains → несколько выпусков и подпапок
 # -----------------------------------------------------------------------------
 
 [[certificates]]
-# Произвольная метка для логов (если пусто — в логах будет #0, #1, … по порядку блоков).
+# Произвольная метка для логов (если пусто — #0, #1, … по порядку блоков).
 id = "sites"
-# Список доменов: wildcard *.a.b даёт SAN *.a.b + a.b; только c.d без *.c.d — отдельный apex-сертификат;
-# имя на один уровень под *.apex попадает в ту же wildcard-группу. Несколько *. — несколько wc-* каталогов.
-# Зона FastDNS для DNS-01: последние две метки apex (для поддоменов той же «корневой» зоны в панели).
+# Имя провайдера из [[providers]] — куда писать TXT для DNS-01 всего блока (строка или массив).
+provider = ["fv-main"]
+# Список доменов: wildcard *.a.b даёт SAN *.a.b + a.b; только c.d — отдельный apex;
+# несколько *. — несколько wc-* каталогов под output_dir.
 domains = ["*.example.com"]
-# Базовый каталог: внутри wc-* / apex-* — каталоги YYYY-MM-DD (fullchain, privkey, issuer), symlink live -> актуальная дата.
-# При прерывании выпуска в этом каталоге может появиться .obtain-checkpoint.json — по нему
-# при следующем запуске продолжится тот же заказ ACME (те же TXT в FastDNS, без нового заказа).
+# Базовый каталог: внутри wc-* / apex-* — YYYY-MM-DD (fullchain, privkey, issuer), symlink live.
+# При прерывании выпуска может появиться .obtain-checkpoint.json — продолжение того же заказа ACME.
 output_dir = "./out/sites"
-# Алгоритм ключа сертификата: ec256 | ec384 | rsa2048 | rsa3072 | rsa4096 | rsa8192.
+# Алгоритм ключа: ec256 | ec384 | rsa2048 | rsa3072 | rsa4096 | rsa8192.
 key_type = "ec256"
-# За сколько календарных дней до NotAfter перевыпускать (или если нет fullchain по пути live/ или legacy).
+# За сколько дней до NotAfter перевыпускать (или если нет fullchain).
 renew_before_days = 25
+
+# -----------------------------------------------------------------------------
+# [sync] — полное зеркало DNS-записей: master → slaves
+# -----------------------------------------------------------------------------
+#
+# Master — источник правды. Каждый slave приводится к тому же набору записей
+# (создание, обновление, удаление лишнего). По умолчанию не синхронизируются
+# имена _acme-challenge.* — TXT для ACME остаются только на провайдере из
+# [[certificates]].provider.
+#
+# enabled = false — только ACME, без sync.
+# enabled = true  — в daemon: цикл sync каждые sync.interval; в once: один проход после ACME.
+
+[sync]
+enabled = false
+# Пауза между циклами sync в режиме daemon.
+interval = "onstart"
+# Типы записей для зеркалирования; по умолчанию все поддерживаемые типы.
+# record_types = ["A", "AAAA", "CNAME", "MX", "TXT", "NS", "SRV"]
+# Исключения по имени (glob); по умолчанию ["_acme-challenge.*"].
+# exclude_names = ["_acme-challenge.*"]
+
+# [[sync.zones]]
+# zone = "example.com"
+# master = "fv-main"
+# slaves = ["ali-dns"]
+#
+# [[sync.zones]]
+# zone = "example.com"
+# master = "file:///etc/certbot-dns/example.com.zone"
+# slaves = ["ali-dns"]
 
 # -----------------------------------------------------------------------------
 # [runtime] — режим процесса и логирование
 # -----------------------------------------------------------------------------
 
 [runtime]
-# "once" — один проход (проверка сроков, выпуск при необходимости) и выход процесса.
-# "daemon" — бесконечный цикл: сон до следующей проверки или срока продления.
+# "once" — один проход (проверка сроков, выпуск, sync при enabled) и выход.
+# "daemon" — бесконечный цикл: ACME + sync, сон до следующей проверки.
 mode = "once"
-# В режиме daemon: если все сертификаты свежие, не спать дольше этого без повторной проверки файлов на диске.
+# В daemon: если все сертификаты свежие, не спать дольше этого без повторной проверки.
 poll_when_ok = "24h"
-# Уровень логов в stdout: debug | verbose | info | warning | error | fatal.
-# debug — максимум сообщений + файл:строка в логе; verbose — то же по фильтру, без file:line;
-# info — штатная работа; warning / error / fatal — только более важные сообщения (fatal — критические + exit).
+# Уровень логов: debug | verbose | info | warning | error | fatal.
 loglevel = "info"
 
 # =============================================================================
 # Ниже — закомментированные примеры (раскомментируйте по необходимости).
 # =============================================================================
 
-# --- Пример A: wildcard + явный apex (один сертификат, один wc-*)
+# --- Пример A: wildcard + apex, один провайдер ---
 #
 # [[certificates]]
-# # Метка в логах.
 # id = "a"
-# # Два SAN в одном сертификате; apex можно не дублировать, если есть только *.example.com.
+# provider = "fv-main"
 # domains = ["*.example.com", "example.com"]
-# # Каталог с wc-example-com внутри.
 # output_dir = "./out/a"
-# # Тип ключа.
 # key_type = "ec256"
-# # Порог продления в днях.
 # renew_before_days = 25
 
-# --- Пример B: только apex без wildcard (каталог apex-*)
+# --- Пример B: только apex (каталог apex-*) ---
 #
 # [[certificates]]
 # id = "b"
+# provider = "fv-main"
 # domains = ["example.com"]
 # output_dir = "./out/b"
 # key_type = "ec256"
 # renew_before_days = 25
 
-# --- Пример C: один список → 5 сертификатов (5 подкаталогов под output_dir)
-#
-# [[certificates]]
-# id = "multi"
-# domains = [
-#   "*.example.com",
-#   "example.com",
-#   "*.demo.example.com",
-#   "*.lvl4.lvl3.example.com",
-#   "*.demo.com",
-#   "demo2.com",
-# ]
-# output_dir = "./out/multi"
-# key_type = "ec256"
-# renew_before_days = 25
-
-# --- Пример D: два блока [[certificates]]
+# --- Пример C: два блока [[certificates]] с разными провайдерами ---
 #
 # [[certificates]]
 # id = "shop"
+# provider = "fv-main"
 # domains = ["*.shop.example.net", "cdn.shop.example.net"]
 # output_dir = "./out/shop"
 # key_type = "ec256"
 # renew_before_days = 25
 #
 # [[certificates]]
-# id = "blog"
-# domains = ["blog.org"]
-# output_dir = "./out/blog"
+# id = "backup"
+# provider = "ali-dns"
+# domains = ["*.backup.net"]
+# output_dir = "./out/backup"
+# key_type = "ec256"
+# renew_before_days = 25
+
+# --- Пример D: sync нескольких зон ---
+#
+# [sync]
+# enabled = true
+# interval = "onstart"
+#
+# [[sync.zones]]
+# zone = "example.com"
+# master = "fv-main"
+# slaves = ["ali-dns"]
+#
+# [[sync.zones]]
+# zone = "raidkon.com"
+# master = "fv-main"
+# slaves = ["ali-dns"]
+
+# --- Пример E: миграция со старого [fastdns] (без [[providers]]) ---
+#
+# [fastdns]
+# api_token = "${FASTDNS_API_TOKEN}"
+#
+# [[certificates]]
+# id = "legacy"
+# # provider не указан — используется "default" из [fastdns]
+# domains = ["*.example.com"]
+# output_dir = "./out/legacy"
 # key_type = "ec256"
 # renew_before_days = 25

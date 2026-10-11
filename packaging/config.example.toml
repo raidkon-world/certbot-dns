@@ -6,8 +6,17 @@ email = "admin@example.com"
 directory = "production"
 state_dir = "/var/lib/certbot-dns/acme-state"
 
-[fastdns]
+[[providers]]
+name = "fv-main"
+type = "fastdns"
 api_token = "${FASTDNS_API_TOKEN}"
+
+# [[providers]]
+# name = "ali-dns"
+# type = "alibabacloud"
+# access_key_id = "${ALIBABA_ACCESS_KEY_ID}"
+# access_key_secret = "${ALIBABA_ACCESS_KEY_SECRET}"
+# region_id = "${ALIBABA_REGION_ID}"
 
 [dns_challenge]
 propagation_timeout = "24h"
@@ -15,10 +24,27 @@ propagation_interval = "10m"
 
 [[certificates]]
 id = "sites"
+provider = ["fv-main"]
+# provider = ["fv-main", "ali-dns"]
 domains = ["*.example.com"]
 output_dir = "/var/lib/certbot-dns/certs/sites"
 key_type = "ec256"
 renew_before_days = 25
+
+[sync]
+enabled = false
+interval = "onstart"
+# interval = "5m"
+
+# [[sync.zones]]
+# zone = "example.com"
+# master = "fv-main"
+# slaves = ["ali-dns"]
+#
+# [[sync.zones]]
+# zone = "example.com"
+# master = "file:///etc/certbot-dns/example.com.zone"
+# slaves = ["ali-dns"]
 
 [runtime]
 mode = "daemon"

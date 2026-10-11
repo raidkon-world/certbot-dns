@@ -10,7 +10,8 @@ import (
 // ExpandedCert — один выпуск после разборки domains (зона и каталог выводятся автоматически).
 type ExpandedCert struct {
 	Label           string   // для логов
-	Zone            string   // зона FastDNS в панели (обычно «домен.tld» — последние две метки apex)
+	Providers       []string // имена [[providers]] для DNS-01
+	Zone            string   // apex-зона в панели DNS (обычно последние две метки)
 	Domains         []string // список SAN в запросе к ACME
 	OutputDir       string   // каталог выпуска: YYYY-MM-DD/*.pem и symlink live/
 	KeyType         string
@@ -39,7 +40,8 @@ func normDomain(d string) string {
 //   - *.a.b → сертификат SAN: *.a.b и a.b (apex подставляется сам);
 //   - имя на один уровень под этим apex (www.a.b) попадает в ту же группу, если в списке есть *.a.b;
 //   - только c.d без подходящего *.… в списке → отдельный сертификат (зона FastDNS — fastDNSRootZone(c.d)).
-func expandCertEntry(entry CertConfig, parentIdx int) ([]ExpandedCert, error) {
+func expandCertEntry(entry CertConfig, parentIdx int, _ map[string]*providerRuntime) ([]ExpandedCert, error) {
+	providerNames := entry.Providers.names(defaultProviderName)
 	raw := dedupePreserveOrder(entry.Domains)
 	var norm []string
 	for _, d := range raw {
@@ -129,6 +131,7 @@ func expandCertEntry(entry CertConfig, parentIdx int) ([]ExpandedCert, error) {
 		}
 		out = append(out, ExpandedCert{
 			Label:           fmt.Sprintf("%s/%s", parentLabel, slugForApex(apex)),
+			Providers:       append([]string(nil), providerNames...),
 			Zone:            fastDNSRootZone(apex),
 			Domains:         sortedDomains(mapKeys(g.domains)),
 			OutputDir:       filepath.Join(baseOut, "wc-"+slugForApex(apex)),
@@ -147,6 +150,7 @@ func expandCertEntry(entry CertConfig, parentIdx int) ([]ExpandedCert, error) {
 		}
 		out = append(out, ExpandedCert{
 			Label:           fmt.Sprintf("%s/%s", parentLabel, slugForApex(d)),
+			Providers:       append([]string(nil), providerNames...),
 			Zone:            fastDNSRootZone(d),
 			Domains:         []string{d},
 			OutputDir:       filepath.Join(baseOut, "apex-"+slugForApex(d)),
@@ -158,10 +162,10 @@ func expandCertEntry(entry CertConfig, parentIdx int) ([]ExpandedCert, error) {
 	return out, nil
 }
 
-func expandAllCerts(entries []CertConfig) ([]ExpandedCert, error) {
+func expandAllCerts(entries []CertConfig, registry map[string]*providerRuntime) ([]ExpandedCert, error) {
 	var all []ExpandedCert
 	for i := range entries {
-		expanded, err := expandCertEntry(entries[i], i)
+		expanded, err := expandCertEntry(entries[i], i, registry)
 		if err != nil {
 			return nil, fmt.Errorf("certificates[%d]: %w", i, err)
 		}
